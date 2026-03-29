@@ -4,9 +4,11 @@ import {
   createWalletClient,
   fallback,
   formatEther,
+  formatUnits,
   http,
   isAddressEqual,
   parseAbiItem,
+  parseGwei,
 } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { base } from 'viem/chains'
@@ -49,6 +51,11 @@ const publicClient = createPublicClient({
   ]),
 })
 
+const sendClient = createPublicClient({
+  chain: base,
+  transport: http(env.rpcPrimary),
+})
+
 const walletClient = createWalletClient({
   account,
   chain: base,
@@ -61,6 +68,9 @@ const executedForEvent = parseAbiItem(
 
 let isTickRunning = false
 let lastSubmittedAt = 0
+const BPS = 10_000n
+const minMaxFeePerGas = parseGwei(env.minMaxFeeGwei)
+const minPriorityFeePerGas = parseGwei(env.minPriorityFeeGwei)
 
 function log(message: string, extra?: Record<string, unknown>) {
   if (extra) {
@@ -80,6 +90,65 @@ function buildRandomBlocks(numBlocks: number): number[] {
     picked.add(randomInt(0, GRID_SIZE))
   }
   return [...picked]
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function isRetryableNonceError(message: string) {
+  const normalized = message.toLowerCase()
+  return (
+    normalized.includes('replacement transaction underpriced') ||
+    normalized.includes('replacement fee too low') ||
+    normalized.includes('transaction underpriced') ||
+    normalized.includes('nonce too low') ||
+    normalized.includes('already known') ||
+    normalized.includes('max fee per gas less than block base fee') ||
+    normalized.includes('fee cap less than block base fee')
+  )
+}
+
+function applyBps(value: bigint, bps: bigint) {
+  if (value === 0n) return 0n
+  return (value * bps + (BPS - 1n)) / BPS
+}
+
+async function getFeeOverrides(attempt: number) {
+  let baseMaxFeePerGas: bigint | undefined
+  let basePriorityFeePerGas: bigint | undefined
+
+  try {
+    const feeData = await sendClient.estimateFeesPerGas({ type: 'eip1559' })
+    baseMaxFeePerGas = feeData.maxFeePerGas ?? feeData.gasPrice
+    basePriorityFeePerGas = feeData.maxPriorityFeePerGas
+  } catch {
+    // fallback below
+  }
+
+  if (!baseMaxFeePerGas) {
+    baseMaxFeePerGas = await sendClient.getGasPrice()
+  }
+  if (!basePriorityFeePerGas) {
+    basePriorityFeePerGas = minPriorityFeePerGas
+  }
+
+  const bumpBps = BigInt(env.gasBumpBps + (attempt - 1) * env.gasRetryStepBps)
+
+  let maxFeePerGas = applyBps(baseMaxFeePerGas, bumpBps)
+  let maxPriorityFeePerGas = applyBps(basePriorityFeePerGas, bumpBps)
+
+  if (maxFeePerGas < minMaxFeePerGas) {
+    maxFeePerGas = minMaxFeePerGas
+  }
+  if (maxPriorityFeePerGas < minPriorityFeePerGas) {
+    maxPriorityFeePerGas = minPriorityFeePerGas
+  }
+  if (maxFeePerGas <= maxPriorityFeePerGas) {
+    maxFeePerGas = maxPriorityFeePerGas + 1n
+  }
+
+  return { maxFeePerGas, maxPriorityFeePerGas }
 }
 
 async function getActiveUsers(): Promise<Address[]> {
@@ -225,42 +294,87 @@ async function tick() {
       const users = batch.map((entry) => entry.user)
       const blocks = batch.map((entry) => entry.blocks)
 
-      log('submitting executeBatch', {
-        roundId: currentRoundId.toString(),
-        users: users.length,
-      })
+      let receipt:
+        | Awaited<ReturnType<typeof publicClient.waitForTransactionReceipt>>
+        | undefined
 
-      const request = await publicClient.simulateContract({
-        address: CONTRACTS.autoMiner,
-        abi: autoMinerAbi,
-        functionName: 'executeBatch',
-        args: [users, blocks],
-        account,
-      })
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          const nonce = await sendClient.getTransactionCount({
+            address: account.address,
+            blockTag: 'pending',
+          })
+          const feeOverrides = await getFeeOverrides(attempt)
 
-      const hash = await walletClient.writeContract(request.request)
-      lastSubmittedAt = Date.now()
+          log('submitting executeBatch', {
+            roundId: currentRoundId.toString(),
+            users: users.length,
+            nonce,
+            attempt,
+            maxFeePerGasGwei: formatUnits(feeOverrides.maxFeePerGas, 9),
+            maxPriorityFeePerGasGwei: formatUnits(feeOverrides.maxPriorityFeePerGas, 9),
+          })
 
-      const receipt = await publicClient.waitForTransactionReceipt({ hash })
-      const events = await publicClient.getContractEvents({
-        address: CONTRACTS.autoMiner,
-        abi: [executedForEvent],
-        eventName: 'ExecutedFor',
-        fromBlock: receipt.blockNumber,
-        toBlock: receipt.blockNumber,
-      })
+          const request = await publicClient.simulateContract({
+            address: CONTRACTS.autoMiner,
+            abi: autoMinerAbi,
+            functionName: 'executeBatch',
+            args: [users, blocks],
+            account,
+            nonce,
+            type: 'eip1559',
+            ...feeOverrides,
+          })
 
-      const deployedUsers = new Set(events.map((event) => event.args.user?.toLowerCase()))
-      const totalDeployed = batch
-        .filter((entry) => deployedUsers.has(entry.user.toLowerCase()))
-        .reduce((sum, entry) => sum + (entry.config.amountPerBlock * BigInt(entry.config.numBlocks)), 0n)
+          const hash = await walletClient.writeContract({
+            address: CONTRACTS.autoMiner,
+            abi: autoMinerAbi,
+            functionName: 'executeBatch',
+            args: [users, blocks],
+            account,
+            nonce,
+            gas: request.request.gas,
+            type: 'eip1559',
+            ...feeOverrides,
+          })
+          lastSubmittedAt = Date.now()
 
-      log('executeBatch confirmed', {
-        roundId: currentRoundId.toString(),
-        txHash: hash,
-        executedUsers: deployedUsers.size,
-        totalDeployedEth: formatEther(totalDeployed),
-      })
+          receipt = await publicClient.waitForTransactionReceipt({ hash })
+
+          const events = await publicClient.getContractEvents({
+            address: CONTRACTS.autoMiner,
+            abi: [executedForEvent],
+            eventName: 'ExecutedFor',
+            fromBlock: receipt.blockNumber,
+            toBlock: receipt.blockNumber,
+          })
+
+          const deployedUsers = new Set(events.map((event) => event.args.user?.toLowerCase()))
+          const totalDeployed = batch
+            .filter((entry) => deployedUsers.has(entry.user.toLowerCase()))
+            .reduce((sum, entry) => sum + (entry.config.amountPerBlock * BigInt(entry.config.numBlocks)), 0n)
+
+          log('executeBatch confirmed', {
+            roundId: currentRoundId.toString(),
+            txHash: hash,
+            executedUsers: deployedUsers.size,
+            totalDeployedEth: formatEther(totalDeployed),
+          })
+          break
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          if (attempt < 3 && isRetryableNonceError(message)) {
+            log('retrying executeBatch after nonce error', { attempt, error: message })
+            await sleep(1200)
+            continue
+          }
+          throw error
+        }
+      }
+
+      if (!receipt) {
+        throw new Error('executeBatch did not return a receipt')
+      }
     }
   } catch (error) {
     console.error('[executor] tick failed', error)
