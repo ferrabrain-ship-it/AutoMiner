@@ -2,7 +2,6 @@ import { randomInt } from 'node:crypto'
 import {
   createPublicClient,
   createWalletClient,
-  fallback,
   formatEther,
   formatUnits,
   http,
@@ -41,16 +40,6 @@ type ExecutableEntry = {
 
 const account = privateKeyToAccount(env.executorPrivateKey)
 
-const publicClient = createPublicClient({
-  chain: base,
-  transport: fallback([
-    http(env.rpcPrimary),
-    http(env.rpcFallback1),
-    http(env.rpcFallback2),
-    http(env.rpcFallback3),
-  ]),
-})
-
 const sendClient = createPublicClient({
   chain: base,
   transport: http(env.rpcPrimary),
@@ -68,6 +57,8 @@ const executedForEvent = parseAbiItem(
 
 let isTickRunning = false
 let lastSubmittedAt = 0
+let trackedRoundId = 0n
+const executedUsersThisRound = new Set<string>()
 const BPS = 10_000n
 const minMaxFeePerGas = parseGwei(env.minMaxFeeGwei)
 const minPriorityFeePerGas = parseGwei(env.minPriorityFeeGwei)
@@ -152,7 +143,7 @@ async function getFeeOverrides(attempt: number) {
 }
 
 async function getActiveUsers(): Promise<Address[]> {
-  const total = await publicClient.readContract({
+  const total = await sendClient.readContract({
     address: CONTRACTS.autoMiner,
     abi: autoMinerAbi,
     functionName: 'getActiveUserCount',
@@ -162,7 +153,7 @@ async function getActiveUsers(): Promise<Address[]> {
   const batchSize = 100n
 
   for (let offset = 0n; offset < total; offset += batchSize) {
-    const chunk = await publicClient.readContract({
+    const chunk = await sendClient.readContract({
       address: CONTRACTS.autoMiner,
       abi: autoMinerAbi,
       functionName: 'getActiveUsers',
@@ -177,13 +168,13 @@ async function getActiveUsers(): Promise<Address[]> {
 
 async function getExecutableEntry(user: Address): Promise<ExecutableEntry | null> {
   const [canExecute, state] = await Promise.all([
-    publicClient.readContract({
+    sendClient.readContract({
       address: CONTRACTS.autoMiner,
       abi: autoMinerAbi,
       functionName: 'canExecute',
       args: [user],
     }) as Promise<[boolean, string]>,
-    publicClient.readContract({
+    sendClient.readContract({
       address: CONTRACTS.autoMiner,
       abi: autoMinerAbi,
       functionName: 'getUserState',
@@ -216,17 +207,17 @@ async function tick() {
 
   try {
     const [currentRoundId, gameStarted, configuredExecutor] = await Promise.all([
-      publicClient.readContract({
+      sendClient.readContract({
         address: CONTRACTS.gridMining,
         abi: gridMiningAbi,
         functionName: 'currentRoundId',
       }) as Promise<bigint>,
-      publicClient.readContract({
+      sendClient.readContract({
         address: CONTRACTS.gridMining,
         abi: gridMiningAbi,
         functionName: 'gameStarted',
       }) as Promise<boolean>,
-      publicClient.readContract({
+      sendClient.readContract({
         address: CONTRACTS.autoMiner,
         abi: autoMinerAbi,
         functionName: 'executor',
@@ -242,7 +233,12 @@ async function tick() {
       return
     }
 
-    const currentRound = await publicClient.readContract({
+    if (trackedRoundId !== currentRoundId) {
+      trackedRoundId = currentRoundId
+      executedUsersThisRound.clear()
+    }
+
+    const currentRound = await sendClient.readContract({
       address: CONTRACTS.gridMining,
       abi: gridMiningAbi,
       functionName: 'rounds',
@@ -278,9 +274,9 @@ async function tick() {
       return
     }
 
-    const entries = (await Promise.all(activeUsers.map(getExecutableEntry))).filter(
-      (entry): entry is ExecutableEntry => entry !== null
-    )
+    const entries = (await Promise.all(activeUsers.map(getExecutableEntry)))
+      .filter((entry): entry is ExecutableEntry => entry !== null)
+      .filter((entry) => !executedUsersThisRound.has(entry.user.toLowerCase()))
     if (entries.length === 0) {
       return
     }
@@ -291,11 +287,16 @@ async function tick() {
     }
 
     for (const batch of batches) {
-      const users = batch.map((entry) => entry.user)
-      const blocks = batch.map((entry) => entry.blocks)
+      const filteredBatch = batch.filter((entry) => !executedUsersThisRound.has(entry.user.toLowerCase()))
+      if (filteredBatch.length === 0) {
+        continue
+      }
+
+      const users = filteredBatch.map((entry) => entry.user)
+      const blocks = filteredBatch.map((entry) => entry.blocks)
 
       let receipt:
-        | Awaited<ReturnType<typeof publicClient.waitForTransactionReceipt>>
+        | Awaited<ReturnType<typeof sendClient.waitForTransactionReceipt>>
         | undefined
 
       for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -315,7 +316,7 @@ async function tick() {
             maxPriorityFeePerGasGwei: formatUnits(feeOverrides.maxPriorityFeePerGas, 9),
           })
 
-          const request = await publicClient.simulateContract({
+          const request = await sendClient.simulateContract({
             address: CONTRACTS.autoMiner,
             abi: autoMinerAbi,
             functionName: 'executeBatch',
@@ -339,9 +340,9 @@ async function tick() {
           })
           lastSubmittedAt = Date.now()
 
-          receipt = await publicClient.waitForTransactionReceipt({ hash })
+          receipt = await sendClient.waitForTransactionReceipt({ hash })
 
-          const events = await publicClient.getContractEvents({
+          const events = await sendClient.getContractEvents({
             address: CONTRACTS.autoMiner,
             abi: [executedForEvent],
             eventName: 'ExecutedFor',
@@ -350,7 +351,13 @@ async function tick() {
           })
 
           const deployedUsers = new Set(events.map((event) => event.args.user?.toLowerCase()))
-          const totalDeployed = batch
+          for (const user of deployedUsers) {
+            if (user) {
+              executedUsersThisRound.add(user)
+            }
+          }
+
+          const totalDeployed = filteredBatch
             .filter((entry) => deployedUsers.has(entry.user.toLowerCase()))
             .reduce((sum, entry) => sum + (entry.config.amountPerBlock * BigInt(entry.config.numBlocks)), 0n)
 
