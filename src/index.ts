@@ -7,6 +7,7 @@ import {
   http,
   isAddressEqual,
   parseAbiItem,
+  parseEventLogs,
   parseGwei,
 } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
@@ -355,13 +356,12 @@ async function tick() {
 
           receipt = await sendClient.waitForTransactionReceipt({ hash })
 
-          const events = await sendClient.getContractEvents({
-            address: CONTRACTS.autoMiner,
+          const events = parseEventLogs({
             abi: [executedForEvent],
+            logs: receipt.logs,
             eventName: 'ExecutedFor',
-            fromBlock: receipt.blockNumber,
-            toBlock: receipt.blockNumber,
-          })
+            strict: false,
+          }).filter((event) => isAddressEqual(event.address, CONTRACTS.autoMiner))
 
           const deployedUsers = new Set(events.map((event) => event.args.user?.toLowerCase()))
           for (const user of deployedUsers) {
