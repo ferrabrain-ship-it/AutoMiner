@@ -212,7 +212,7 @@ async function tick() {
   isTickRunning = true
 
   try {
-    const [currentRoundId, gameStarted, configuredExecutor, minGasForBatch] = await Promise.all([
+    const [currentRoundId, gameStarted, configuredExecutor, minGasForBatch, latestNonce, pendingNonce] = await Promise.all([
       sendClient.readContract({
         address: CONTRACTS.gridMining,
         abi: gridMiningAbi,
@@ -233,6 +233,14 @@ async function tick() {
         abi: autoMinerAbi,
         functionName: 'minGasForBatch',
       }) as Promise<bigint>,
+      sendClient.getTransactionCount({
+        address: account.address,
+        blockTag: 'latest',
+      }),
+      sendClient.getTransactionCount({
+        address: account.address,
+        blockTag: 'pending',
+      }),
     ])
 
     if (!isAddressEqual(configuredExecutor, account.address)) {
@@ -241,6 +249,15 @@ async function tick() {
 
     if (!gameStarted || currentRoundId === 0n) {
       log('protocol not started yet')
+      return
+    }
+
+    if (pendingNonce > latestNonce) {
+      log('skipping tick because executor has a pending transaction', {
+        roundId: currentRoundId.toString(),
+        latestNonce,
+        pendingNonce,
+      })
       return
     }
 
