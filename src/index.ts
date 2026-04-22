@@ -105,6 +105,11 @@ function applyBps(value: bigint, bps: bigint) {
   return (value * bps + (BPS - 1n)) / BPS
 }
 
+function getBufferedGasLimit(minGasForBatch: bigint) {
+  const buffered = applyBps(minGasForBatch, BigInt(env.gasLimitBufferBps))
+  return buffered > minGasForBatch ? buffered : minGasForBatch
+}
+
 async function getFeeOverrides(attempt: number) {
   let baseMaxFeePerGas: bigint | undefined
   let basePriorityFeePerGas: bigint | undefined
@@ -206,7 +211,7 @@ async function tick() {
   isTickRunning = true
 
   try {
-    const [currentRoundId, gameStarted, configuredExecutor] = await Promise.all([
+    const [currentRoundId, gameStarted, configuredExecutor, minGasForBatch] = await Promise.all([
       sendClient.readContract({
         address: CONTRACTS.gridMining,
         abi: gridMiningAbi,
@@ -222,6 +227,11 @@ async function tick() {
         abi: autoMinerAbi,
         functionName: 'executor',
       }) as Promise<Address>,
+      sendClient.readContract({
+        address: CONTRACTS.autoMiner,
+        abi: autoMinerAbi,
+        functionName: 'minGasForBatch',
+      }) as Promise<bigint>,
     ])
 
     if (!isAddressEqual(configuredExecutor, account.address)) {
@@ -294,6 +304,7 @@ async function tick() {
 
       const users = filteredBatch.map((entry) => entry.user)
       const blocks = filteredBatch.map((entry) => entry.blocks)
+      const gasLimit = getBufferedGasLimit(minGasForBatch)
 
       let receipt:
         | Awaited<ReturnType<typeof sendClient.waitForTransactionReceipt>>
@@ -312,6 +323,7 @@ async function tick() {
             users: users.length,
             nonce,
             attempt,
+            gasLimit: gasLimit.toString(),
             maxFeePerGasGwei: formatUnits(feeOverrides.maxFeePerGas, 9),
             maxPriorityFeePerGasGwei: formatUnits(feeOverrides.maxPriorityFeePerGas, 9),
           })
@@ -323,6 +335,7 @@ async function tick() {
             args: [users, blocks],
             account,
             nonce,
+            gas: gasLimit,
             type: 'eip1559',
             ...feeOverrides,
           })
@@ -334,7 +347,7 @@ async function tick() {
             args: [users, blocks],
             account,
             nonce,
-            gas: request.request.gas,
+            gas: gasLimit,
             type: 'eip1559',
             ...feeOverrides,
           })

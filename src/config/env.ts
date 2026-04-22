@@ -30,6 +30,7 @@ export const env = {
   minRoundBufferMs: numberEnv('EXECUTOR_MIN_ROUND_BUFFER_MS', 20000),
   gasBumpBps: numberEnv('EXECUTOR_GAS_BUMP_BPS', 13000),
   gasRetryStepBps: numberEnv('EXECUTOR_GAS_RETRY_STEP_BPS', 2000),
+  gasLimitBufferBps: numberEnv('EXECUTOR_GAS_LIMIT_BUFFER_BPS', 12000),
   minMaxFeeGwei: process.env.EXECUTOR_MIN_MAX_FEE_GWEI || '0.05',
   minPriorityFeeGwei: process.env.EXECUTOR_MIN_PRIORITY_FEE_GWEI || '0.01',
 }
